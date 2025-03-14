@@ -1,14 +1,11 @@
 package v1
 
 import (
-	"fmt"
 	"log"
 	"sync"
 
 	"reacher-cron/client"
-	"reacher-cron/models"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/robfig/cron/v3"
 )
 
@@ -41,7 +38,7 @@ func syncMonitorJobs() {
 	db := client.ConnectPostgres()
 	rdb := client.ConnectRedis()
 
-	monitors, err := FetchAllMonitors(db)
+	monitors, err := FetchAllMonitors()
 	if err != nil {
 		log.Println("[CRON] Error fetching monitors:", err)
 		return
@@ -56,8 +53,6 @@ func syncMonitorJobs() {
 	// 1️ Adicionar ou atualizar jobs apenas para monitores "Active"
 	for _, monitor := range monitors {
 		activeMonitors[monitor.ID] = true
-
-		updateMonitorInfoInRedis(monitor, rdb)
 
 		if monitor.Status != "Active" {
 			// Se for "Inactive", não ganha job, mas mantemos os dados no Redis
@@ -101,87 +96,9 @@ func syncMonitorJobs() {
 		}
 	}
 
-	// 3️ Remover do Redis **somente monitores que foram deletados do banco**
-	removeDeletedMonitorsFromRedis(rdb, activeMonitors)
 }
 
 // Função para converter cron expression para 6 campos se necessário
 func getCronExpression(interval string) string {
 	return interval
-}
-
-func updateMonitorInfoInRedis(m models.Monitor, rdb *redis.Client) {
-	key := fmt.Sprintf("monitor:%d", m.ID)
-
-	// 🔹 Buscar os dados atuais do Redis para esse monitor
-	existingData, err := rdb.HGetAll(client.Ctx, key).Result()
-	if err != nil {
-		log.Printf("[REDIS] Error fetching monitor %d: %v", m.ID, err)
-		return
-	}
-
-	// 🔹 Preparar os dados esperados
-	groupID := "0"
-	if m.GroupID.Valid {
-		groupID = fmt.Sprintf("%d", m.GroupID.Int64)
-	}
-
-	expectedData := map[string]string{
-		"status":                     m.Status,
-		"name":                       m.Name,
-		"group_id":                   groupID,
-		"group_name":                 m.GroupName,
-		"group_visibility":           fmt.Sprintf("%t", m.GroupVisibility),
-		"auto_incident":              fmt.Sprintf("%t", m.AutoIncident),
-		"service_degraded_threshold": fmt.Sprintf("%d", m.ServiceDegradedThreshold.Int64),
-		"partial_outage_threshold":   fmt.Sprintf("%d", m.PartialOutageThreshold.Int64),
-		"major_outage_threshold":     fmt.Sprintf("%d", m.MajorOutageThreshold.Int64),
-		"escalation_window":          fmt.Sprintf("%d", m.EscalationWindow.Int64),
-	}
-
-	// 🔹 Comparar valores e atualizar apenas se forem diferentes
-	needsUpdate := false
-	for key, expectedValue := range expectedData {
-		if existingData[key] != expectedValue {
-			needsUpdate = true
-			break
-		}
-	}
-
-	if needsUpdate {
-		rdb.HSet(client.Ctx, key, expectedData)
-		log.Printf("[REDIS] Updated monitor (ID: %d) information in Redis\n", m.ID)
-	}
-}
-
-// Remove do Redis apenas monitores que **não** aparecem mais na base de dados
-func removeDeletedMonitorsFromRedis(rdb *redis.Client, activeMonitors map[int]bool) {
-	var cursor uint64
-	for {
-		keys, newCursor, err := rdb.Scan(client.Ctx, cursor, "monitor:*", 0).Result()
-		if err != nil {
-			log.Println("[REDIS] Error scanning:", err)
-			break
-		}
-		cursor = newCursor
-
-		for _, key := range keys {
-			var monitorID int
-			_, err := fmt.Sscanf(key, "monitor:%d", &monitorID)
-			if err != nil {
-				continue // Se não for um ID de monitor, pula
-			}
-
-			if !activeMonitors[monitorID] {
-				historyKey := fmt.Sprintf("monitor:%d:history", monitorID)
-				rdb.Del(client.Ctx, key)
-				rdb.Del(client.Ctx, historyKey)
-				log.Printf("[CRON] Removed Redis key: %s and its history\n", key)
-			}
-		}
-
-		if cursor == 0 {
-			break
-		}
-	}
 }
