@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"reacher-cron/client"
 	"reacher-cron/models"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -15,7 +16,13 @@ import (
 const historySize = 1440
 
 func doHealthCheck(m models.Monitor, rdb *redis.Client, db *sql.DB) {
-	hc := &http.Client{Timeout: time.Duration(m.Timeout.Int64) * time.Millisecond}
+	// Verifica se Timeout está definido; se não, usa o valor padrão 5000 ms.
+	timeout := 5000
+	if m.Timeout != nil {
+		timeout = *m.Timeout
+	}
+	hc := &http.Client{Timeout: time.Duration(timeout) * time.Millisecond}
+
 	res, err := hc.Get(m.URL)
 	key := fmt.Sprintf("monitor:%d", m.ID)
 	var healthCheckStatus string
@@ -23,9 +30,10 @@ func doHealthCheck(m models.Monitor, rdb *redis.Client, db *sql.DB) {
 		healthCheckStatus = "down"
 	} else {
 		defer res.Body.Close()
+		// Verifica se ExpectedStatus está definido; se não, usa o valor padrão 200.
 		expected := 200
-		if m.ExpectedStatus.Valid {
-			expected = int(m.ExpectedStatus.Int64)
+		if m.ExpectedStatus != nil {
+			expected = *m.ExpectedStatus
 		}
 		if res.StatusCode == expected {
 			healthCheckStatus = "up"
@@ -41,8 +49,12 @@ func doHealthCheck(m models.Monitor, rdb *redis.Client, db *sql.DB) {
 	log.Printf("[CRON] Monitor %s (ID: %d) => health_check: %s", m.Name, m.ID, healthCheckStatus)
 	updateStatusHistory(rdb, key, healthCheckStatus, timestamp)
 
-	ApplyIncidentRules(m.ID, m.AutoIncident, healthCheckStatus, m.ServiceDegradedThreshold, m.PartialOutageThreshold, m.MajorOutageThreshold, rdb, db)
-
+	// Para aplicar regras de incidente, é importante converter os ponteiros.
+	var autoIncident bool
+	if m.AutoIncident != nil {
+		autoIncident = *m.AutoIncident
+	}
+	ApplyIncidentRules(m.ID, autoIncident, healthCheckStatus, m.ServiceDegradedThreshold, m.PartialOutageThreshold, m.MajorOutageThreshold, rdb, db)
 }
 
 func updateStatusHistory(rdb *redis.Client, key, status, timestamp string) {
@@ -60,7 +72,9 @@ func updateUptime(rdb *redis.Client, historyKey, key string) {
 	}
 	var upCount float64
 	for _, entry := range history {
-		if len(entry) >= 3 && entry[len(entry)-3:] == "|up" {
+		// Considera "up" se a parte final for "|up"
+		parts := strings.Split(entry, "|")
+		if len(parts) == 2 && parts[1] == "up" {
 			upCount++
 		}
 	}

@@ -1,26 +1,29 @@
 package models
 
-import (
-	"database/sql"
-)
+import "time"
 
 // Monitor representa um registro no banco, onde:
 // - Status = "Active" ou "Inactive" (se deve ter job ou não)
 // - Os detalhes de health check ficam no Redis, não aqui.
 type Monitor struct {
-	ID                       int
-	Name                     string
-	URL                      string
-	Status                   string // "Active" ou "Inactive"
-	Interval                 string
-	ExpectedStatus           sql.NullInt64
-	Timeout                  sql.NullInt64
-	AutoIncident             bool
-	ServiceDegradedThreshold sql.NullInt64
-	PartialOutageThreshold   sql.NullInt64
-	MajorOutageThreshold     sql.NullInt64
-	EscalationWindow         sql.NullInt64
-	GroupID                  sql.NullInt64
-	GroupName                string
-	GroupVisibility          bool
+	ID                       int        `json:"id"`
+	Name                     string     `json:"name"`
+	URL                      string     `json:"url"`
+	Status                   string     `json:"status"`
+	LastChecked              *time.Time `json:"lastChecked,omitempty"`
+	ResponseTime             *string    `json:"responseTime,omitempty"`
+	Interval                 string     `json:"interval"`
+	ExpectedStatus           *int       `json:"expectedStatus,omitempty"`
+	Timeout                  *int       `json:"timeout,omitempty"`
+	AutoIncident             *bool      `json:"autoIncident,omitempty"`
+	ServiceDegradedThreshold *int       `json:"serviceDegradedThreshold,omitempty"`
+	PartialOutageThreshold   *int       `json:"partialOutageThreshold,omitempty"`
+	MajorOutageThreshold     *int       `json:"majorOutageThreshold,omitempty"`
+	EscalationWindow         *int       `json:"escalationWindow,omitempty"`
+	Group                    *string    `json:"group,omitempty"`
+	GroupID                  *int       `json:"groupId,omitempty"`
+	GroupName                string     `json:"groupName,omitempty"`
+	GroupVisibility          bool       `json:"groupVisibility,omitempty"`
+	CreatedAt                time.Time  `json:"createdAt"`
+	Tags                     []string   `json:"tags"`
 }
