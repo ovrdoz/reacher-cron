@@ -4,163 +4,132 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"strings"
+	"strconv"
 	"time"
 
 	"reacher-cron/client"
+	"reacher-cron/models"
 
 	"github.com/go-redis/redis/v8"
 )
 
-// NormalizeStatus já existente...
-func NormalizeStatus(healthCheckStatus string, incidentStatus string, ruleExists bool) string {
-	if healthCheckStatus == "up" {
-		return "operational"
-	}
-	if healthCheckStatus == "down" {
-		if ruleExists || incidentStatus == "major_outage" {
-			return "major_outage"
-		}
-		return "service_degraded"
-	}
-	if healthCheckStatus == "degraded" {
-		return "service_degraded"
-	}
-	return "operational"
-}
-
-// ApplyIncidentRules aplica as regras de incidente, atualiza o Redis e, se comprovado,
-// insere o incidente no PostgreSQL (e sincroniza para o Redis)
-func ApplyIncidentRules(monitorID int, autoIncident bool, newStatus string, deg, part, maj interface{}, rdb *redis.Client, db *sql.DB) {
-	key := fmt.Sprintf("monitor:%d", monitorID)
-	// Se o health check retornar "up", garante o status operacional
-	if newStatus == "up" {
-		updateIncidentInRedis(monitorID, "operational", rdb)
-		return
-	}
-	// Se o monitor não está configurado para autoIncident, atualiza com o novo status do health check
-	if !autoIncident {
-		updateIncidentInRedis(monitorID, newStatus, rdb)
+func ProcessIncidentCreation(m models.Monitor, healthStatus models.Status, db *sql.DB, rdb *redis.Client) {
+	if m.AutoIncident == nil || !*m.AutoIncident {
 		return
 	}
 
-	// Recuperar thresholds e a janela de escalonamento do Redis
-	degStr, err := rdb.HGet(client.Ctx, key, "service_degraded_threshold").Result()
-	if err != nil {
-		degStr = "0"
-	}
-	partStr, err := rdb.HGet(client.Ctx, key, "partial_outage_threshold").Result()
-	if err != nil {
-		partStr = "0"
-	}
-	majStr, err := rdb.HGet(client.Ctx, key, "major_outage_threshold").Result()
-	if err != nil {
-		majStr = "0"
-	}
-	windowStr, err := rdb.HGet(client.Ctx, key, "escalation_window").Result()
-	var escalationWindow int
-	if err != nil || strings.TrimSpace(windowStr) == "" {
-		escalationWindow = 5
-	} else {
-		fmt.Sscanf(windowStr, "%d", &escalationWindow)
+	switch m.IncidentCreationCriteria {
+	case "threshold":
+		// Só cria incidente se o status for service_degraded, partial_outage ou major_outage.
+		if healthStatus == models.Operational || healthStatus == models.MajorOutage {
+			return
+		}
+	case "immediate":
+		// "immediate": qualquer falha gera incidente.
+		if healthStatus == models.Operational {
+			return
+		}
 	}
 
-	var degThreshold, partThreshold, majThreshold int
-	fmt.Sscanf(degStr, "%d", &degThreshold)
-	fmt.Sscanf(partStr, "%d", &partThreshold)
-	fmt.Sscanf(majStr, "%d", &majThreshold)
+	// 1) Verifica se já existe um incidente aberto para este monitor
+	var existingIncidentID int
+	err := db.QueryRow(`
+        SELECT id
+        FROM incident
+        WHERE monitor_id = $1
+          AND incident_status = 'open'
+        LIMIT 1
+    `, m.ID).Scan(&existingIncidentID)
 
-	// Recupera o histórico do monitor e filtra os eventos dentro da janela de escalonamento
-	historyKey := fmt.Sprintf("%s:history", key)
-	history, err := rdb.LRange(client.Ctx, historyKey, 0, -1).Result()
-	if err != nil || len(history) == 0 {
-		updateIncidentInRedis(monitorID, newStatus, rdb)
+	if err == nil {
+		// Achamos um incidente com status open => não cria outro
+		log.Printf("[INCIDENT] Not creating new incident for monitor %d because an open incident already exists (ID: %d).", m.ID, existingIncidentID)
+		return
+	} else if err != sql.ErrNoRows {
+		// Se for outro erro, loga e sai
+		log.Printf("[INCIDENT] Error checking open incident for monitor %d: %v", m.ID, err)
 		return
 	}
-	now := time.Now()
-	var total, downCount int
-	for _, entry := range history {
-		parts := strings.Split(entry, "|")
-		if len(parts) != 2 {
-			continue
-		}
-		t, err := time.Parse(time.RFC3339, parts[0])
-		if err != nil {
-			continue
-		}
-		if now.Sub(t) <= time.Duration(escalationWindow)*time.Minute {
-			total++
-			// Considere "down" ou "degraded" como falha
-			if parts[1] == "down" || parts[1] == "degraded" {
-				downCount++
-			}
-		}
-	}
-	var failureRate int
-	if total > 0 {
-		failureRate = (downCount * 100) / total
-	}
-	// Definir o status final baseado na taxa de falha e thresholds
-	var finalStatus string
-	switch {
-	case failureRate >= majThreshold:
-		finalStatus = "major_outage"
-	case failureRate >= partThreshold:
-		finalStatus = "partial_outage"
-	case failureRate >= degThreshold:
-		finalStatus = "service_degraded"
-	default:
-		finalStatus = "operational"
-	}
-	updateIncidentInRedis(monitorID, finalStatus, rdb)
+	// Se chegou aqui, err == sql.ErrNoRows => não existe incidente aberto, podemos criar.
 
-	// Se o status final indicar um incidente, insere no PostgreSQL e sincroniza no Redis.
-	if finalStatus != "operational" {
-		err := createAndSyncIncident(monitorID, finalStatus, db, rdb)
-		if err != nil {
-			log.Printf("Error inserting incident in Postgres: %v", err)
-		} else {
-			log.Printf("Incident inserted and synced for monitor %d", monitorID)
-		}
-	}
-}
-
-// createAndSyncIncident insere um incidente no PostgreSQL e sincroniza os dados para o Redis.
-func createAndSyncIncident(monitorID int, status string, db *sql.DB, rdb *redis.Client) error {
-	title := fmt.Sprintf("Incident detected for monitor %d", monitorID)
-	description := "Incident automatically detected based on failure rate thresholds."
+	// 2) Insere um novo incidente no Postgres
 	query := `
-		INSERT INTO incidents (title, description, monitor_id, status, notify_subscribers)
-		VALUES ($1, $2, $3, $4, true) RETURNING id`
+		INSERT INTO incident (title, description, monitor_id, incident_type, incident_status, notify_subscribers)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, created_at, updated_at
+	`
+	title := "Incident for monitor: " + m.Name
+	description := "Automatic incident creation triggered by health check at " + time.Now().Format(time.RFC3339)
+	notifySubscribers := false
+
 	var incidentID int
-	err := db.QueryRow(query, title, description, monitorID, status).Scan(&incidentID)
+	var createdAt, updatedAt time.Time
+
+	err = db.QueryRow(query,
+		title,
+		description,
+		m.ID,
+		string(healthStatus), // incident_type
+		"open",               // incident_status
+		notifySubscribers,
+	).Scan(&incidentID, &createdAt, &updatedAt)
 	if err != nil {
-		return err
+		log.Printf("[INCIDENT] Error creating incident for monitor %s (ID: %d): %v", m.Name, m.ID, err)
+		return
 	}
 
-	// Agora sincroniza os dados do incidente para o Redis.
-	redisKey := fmt.Sprintf("incident:%d", incidentID)
-	fields := map[string]interface{}{
-		"id":          incidentID,
-		"monitor_id":  monitorID,
-		"status":      status,
-		"title":       title,
-		"description": description,
-		"created_at":  time.Now().Format(time.RFC3339),
-	}
-	if err := rdb.HSet(client.Ctx, redisKey, fields).Err(); err != nil {
-		return err
+	log.Printf("[INCIDENT] Incident created for monitor %s (ID: %d). IncidentID: %d, Type: %s, Status: open",
+		m.Name, m.ID, incidentID, healthStatus)
+
+	// 3) Incrementa contadores diários de incidentes, se quiser
+	dateKey := time.Now().Format("2006-01-02")
+	metricsKey := fmt.Sprintf("monitor:%d:metrics:%s", m.ID, dateKey)
+	switch healthStatus {
+	case models.MajorOutage:
+		if err := rdb.HIncrBy(client.Ctx, metricsKey, "major_outage", 1).Err(); err != nil {
+			log.Printf("[REDIS] Error incrementing major_outage for monitor %s (ID: %d): %v", m.Name, m.ID, err)
+		}
+	case models.PartialOutage:
+		if err := rdb.HIncrBy(client.Ctx, metricsKey, "partial_outage", 1).Err(); err != nil {
+			log.Printf("[REDIS] Error incrementing partial_outage for monitor %s (ID: %d): %v", m.Name, m.ID, err)
+		}
+	case models.ServiceDegraded:
+		if err := rdb.HIncrBy(client.Ctx, metricsKey, "service_degraded", 1).Err(); err != nil {
+			log.Printf("[REDIS] Error incrementing service_degraded for monitor %s (ID: %d): %v", m.Name, m.ID, err)
+		}
 	}
 
-	return nil
+	// 4) Sincroniza o incidente no Redis
+	if err := syncIncidentToRedis(incidentID, m, healthStatus, createdAt, updatedAt, rdb); err != nil {
+		log.Printf("[INCIDENT] Failed to sync incident (ID: %d) to Redis: %v", incidentID, err)
+	}
 }
 
-// updateIncidentInRedis atualiza o campo "overall_status" e registra a hora da última atualização no Redis.
-func updateIncidentInRedis(monitorID int, status string, rdb *redis.Client) {
-	key := fmt.Sprintf("monitor:%d", monitorID)
-	rdb.HSet(client.Ctx, key, map[string]interface{}{
-		"overall_status": status,
-		"last_updated":   time.Now().Format(time.RFC3339),
-	})
-	log.Printf("[INCIDENT] Updated incident info for monitor %d: status=%s", monitorID, status)
+func syncIncidentToRedis(incidentID int, m models.Monitor, status models.Status,
+	createdAt, updatedAt time.Time, rdb *redis.Client) error {
+
+	key := "incident:" + strconv.Itoa(incidentID)
+	incidentData := map[string]interface{}{
+		"id":                 incidentID,
+		"monitor_id":         m.ID,
+		"monitor_name":       m.Name,
+		"incident_type":      string(status),
+		"incident_status":    "open",
+		"created_at":         createdAt.Format(time.RFC3339),
+		"updated_at":         updatedAt.Format(time.RFC3339),
+		"title":              "Incident for monitor: " + m.Name,
+		"description":        "Automatic incident creation triggered by health check",
+		"notify_subscribers": false,
+	}
+
+	if err := rdb.HSet(client.Ctx, key, incidentData).Err(); err != nil {
+		return err
+	}
+
+	if err := rdb.SAdd(client.Ctx, "incidents:ids", incidentID).Err(); err != nil {
+		return err
+	}
+
+	log.Printf("[INCIDENT] Incident data synchronized to Redis for incident ID %d", incidentID)
+	return nil
 }
