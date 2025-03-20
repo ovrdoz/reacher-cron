@@ -19,7 +19,8 @@ type Monitor struct {
 	PartialOutageThreshold   *int       `json:"partialOutageThreshold,omitempty"`
 	MajorOutageThreshold     *int       `json:"majorOutageThreshold,omitempty"`
 	EscalationWindow         *int       `json:"escalationWindow,omitempty"`
-	AutoIncident             *bool      `json:"autoIncident,omitempty"` // Se deve abrir incidentes automaticamente
+	AutoIncident             *bool      `json:"autoIncident,omitempty"`
+	AutoResolveIncident      *bool      `json:"autoResolveIncident,omitempty"`
 	IncidentCreationCriteria string     `json:"incidentCreationCriteria"`
 	Group                    *string    `json:"group,omitempty"`
 	GroupID                  *int       `json:"groupId,omitempty"`

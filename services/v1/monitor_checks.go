@@ -17,7 +17,7 @@ import (
 // doHealthCheck executa o health check para um monitor,
 // usando as regras e, em seguida, chamando ProcessIncidentCreation se necessário.
 func doHealthCheck(m models.Monitor, rdb *redis.Client, db *sql.DB) {
-	startTime := time.Now()
+	startTime := time.Now().UTC()
 	resp, err := http.Get(m.URL)
 	duration := time.Since(startTime)
 
@@ -37,54 +37,52 @@ func doHealthCheck(m models.Monitor, rdb *redis.Client, db *sql.DB) {
 	// Registra o estado e atualiza métricas no Redis.
 	registerStateHistoryAndMetrics(m, healthStatus, duration, rdb)
 
-	// Verifica se a classificação detalhada está habilitada e a automação de incidentes também.
-	if m.ThresholdClassification != nil && *m.ThresholdClassification &&
-		m.AutoIncident != nil && *m.AutoIncident {
-		healthStatus = evaluateDetailedStatus(m, resp, duration)
-	}
+	// entra no looping de validação somente se o status for diferente de operacional
+	if healthStatus != models.Operational {
+		// Verifica se a classificação detalhada está habilitada e a automação de incidentes também.
+		if m.ThresholdClassification != nil && *m.ThresholdClassification && m.AutoIncident != nil && *m.AutoIncident {
 
-	// Processa a criação/atualização do incidente com base no status final avaliado.
-	ProcessIncidentCreation(m, healthStatus, db, rdb)
+			// evaluateDetailedStatus usa thresholds para classificar o monitor como
+			// service_degraded, partial_outage ou major_outage.
+
+			timeout := 5 * time.Second
+			if m.Timeout != nil {
+				timeout = time.Duration(*m.Timeout) * time.Millisecond
+			}
+
+			failureRate := int((duration.Seconds() / timeout.Seconds()) * 100)
+			if m.ServiceDegradedThreshold != nil && m.PartialOutageThreshold != nil &&
+				failureRate >= *m.ServiceDegradedThreshold && failureRate < *m.PartialOutageThreshold {
+				healthStatus = models.ServiceDegraded
+			}
+			if m.PartialOutageThreshold != nil && m.MajorOutageThreshold != nil &&
+				failureRate >= *m.PartialOutageThreshold && failureRate < *m.MajorOutageThreshold {
+				healthStatus = models.PartialOutage
+			}
+			if m.MajorOutageThreshold != nil && failureRate >= *m.MajorOutageThreshold {
+				healthStatus = models.MajorOutage
+			}
+
+			healthStatus = models.MajorOutage
+		}
+		// Processa a criação/atualização do incidente com base no status final avaliado.
+		ProcessIncidentCreation(m, healthStatus, db, rdb)
+	} else {
+		// check no redis se temos incidnet abertos se tiver e o status for up devemo encerrar o incident
+		// Se o monitor está operacional, verifica se o auto fechamento está habilitado.
+		if m.AutoResolveIncident != nil && *m.AutoResolveIncident {
+			ProcessIncidentAutoResolve(m, db, rdb)
+		}
+		log.Printf("[INCIDENT] Monitor %s (ID: %d) incidente has auto closed with status %s AutoResolveIncident: %v", m.Name, m.ID, healthStatus, m.AutoResolveIncident)
+	}
 
 	log.Printf("[HEALTH] Monitor %s (ID: %d) check completed with status %s", m.Name, m.ID, healthStatus)
-}
-
-// evaluateDetailedStatus usa thresholds para classificar o monitor como
-// operational, service_degraded, partial_outage ou major_outage.
-func evaluateDetailedStatus(m models.Monitor, resp *http.Response, duration time.Duration) models.Status {
-	if resp == nil {
-		return models.MajorOutage
-	}
-
-	timeout := 5 * time.Second
-	if m.Timeout != nil {
-		timeout = time.Duration(*m.Timeout) * time.Millisecond
-	}
-
-	failureRate := int((duration.Seconds() / timeout.Seconds()) * 100)
-
-	if m.ServiceDegradedThreshold != nil && failureRate < *m.ServiceDegradedThreshold {
-		return models.Operational
-	}
-	if m.ServiceDegradedThreshold != nil && m.PartialOutageThreshold != nil &&
-		failureRate >= *m.ServiceDegradedThreshold && failureRate < *m.PartialOutageThreshold {
-		return models.ServiceDegraded
-	}
-	if m.PartialOutageThreshold != nil && m.MajorOutageThreshold != nil &&
-		failureRate >= *m.PartialOutageThreshold && failureRate < *m.MajorOutageThreshold {
-		return models.PartialOutage
-	}
-	if m.MajorOutageThreshold != nil && failureRate >= *m.MajorOutageThreshold {
-		return models.MajorOutage
-	}
-
-	return models.MajorOutage
 }
 
 // registerStateHistoryAndMetrics registra o histórico e incrementa contadores de status.
 func registerStateHistoryAndMetrics(m models.Monitor, healthStatus models.Status, duration time.Duration, rdb *redis.Client) {
 	stateHistory := map[string]interface{}{
-		"timestamp":    time.Now().Format(time.RFC3339),
+		"timestamp":    time.Now().UTC().Format(time.RFC3339),
 		"status":       healthStatus,
 		"responseTime": duration.Milliseconds(),
 	}
@@ -109,7 +107,7 @@ func registerStateHistoryAndMetrics(m models.Monitor, healthStatus models.Status
 		log.Printf("[REDIS] Error trimming state history list for monitor %s (ID: %d): %v", m.Name, m.ID, err)
 	}
 
-	dateKey := time.Now().Format("2006-01-02")
+	dateKey := time.Now().UTC().Format("2006-01-02")
 	metricsKey := fmt.Sprintf("monitor:%d:metrics:%s", m.ID, dateKey)
 
 	// Incrementa total de checks

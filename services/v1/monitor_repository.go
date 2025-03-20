@@ -82,14 +82,14 @@ func mapToMonitor(data map[string]string, ctx context.Context, rdb *redis.Client
 	m.Interval = data["interval"]
 
 	// Converte LastChecked, se disponível.
-	if v, ok := data["last_checked"]; ok && v != "" {
+	if v, ok := data["lastChecked"]; ok && v != "" {
 		if t, err := time.Parse(time.RFC3339, v); err == nil {
 			m.LastChecked = &t
 		}
 	}
 
 	// ResponseTime, se disponível.
-	if v, ok := data["response_time"]; ok && v != "" {
+	if v, ok := data["responseTime"]; ok && v != "" {
 		m.ResponseTime = &v
 	}
 
@@ -102,39 +102,45 @@ func mapToMonitor(data map[string]string, ctx context.Context, rdb *redis.Client
 		return nil
 	}
 
-	m.ExpectedStatus = convertInt("expected_status")
+	m.ExpectedStatus = convertInt("expectedStatus")
 	m.Timeout = convertInt("timeout")
-	m.ServiceDegradedThreshold = convertInt("service_degraded_threshold")
-	m.PartialOutageThreshold = convertInt("partial_outage_threshold")
-	m.MajorOutageThreshold = convertInt("major_outage_threshold")
-	m.EscalationWindow = convertInt("escalation_window")
+	m.ServiceDegradedThreshold = convertInt("serviceDegradedThreshold")
+	m.PartialOutageThreshold = convertInt("partialOutageThreshold")
+	m.MajorOutageThreshold = convertInt("majorOutageThreshold")
+	m.EscalationWindow = convertInt("escalationWindow")
 
-	// Converte auto_incident para booleano.
-	if v, ok := data["auto_incident"]; ok && v != "" {
+	// Converte autoIncident para booleano.
+	if v, ok := data["autoIncident"]; ok && v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			m.AutoIncident = &b
 		}
 	}
 
-	// Novo campo: threshold_classification (booleano).
-	if v, ok := data["threshold_classification"]; ok && v != "" {
+	if v, ok := data["autoResolveIncident"]; ok && v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			m.AutoResolveIncident = &b
+		}
+	}
+
+	// Novo campo: thresholdClassification (booleano).
+	if v, ok := data["thresholdClassification"]; ok && v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			m.ThresholdClassification = &b
 		}
 	}
 
-	// Novo campo: incident_creation_criteria (string).
-	m.IncidentCreationCriteria = data["incident_creation_criteria"]
+	// Novo campo: incidentCreationCriteria (string).
+	m.IncidentCreationCriteria = data["incidentCreationCriteria"]
 
 	// GroupID
-	if v, ok := data["group_id"]; ok && v != "" {
+	if v, ok := data["groupId"]; ok && v != "" {
 		if num, err := strconv.Atoi(v); err == nil {
 			m.GroupID = &num
 		}
 	}
 
 	// CreatedAt: converte usando RFC3339.
-	if v, ok := data["created_at"]; ok && v != "" {
+	if v, ok := data["createdAt"]; ok && v != "" {
 		if t, err := time.Parse(time.RFC3339, v); err == nil {
 			m.CreatedAt = t
 		}
@@ -147,7 +153,7 @@ func mapToMonitor(data map[string]string, ctx context.Context, rdb *redis.Client
 		m.Tags = []string{}
 	}
 
-	// Busca o nome do grupo, se group_id existir.
+	// Busca o nome do grupo, se groupId existir.
 	if m.GroupID != nil && *m.GroupID > 0 {
 		groupKey := fmt.Sprintf("monitor_group:%d", *m.GroupID)
 		groupData, err := rdb.HGetAll(ctx, groupKey).Result()
